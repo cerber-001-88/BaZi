@@ -37,7 +37,7 @@ ADMIN_IDS = [int(id.strip()) for id in os.getenv("ADMIN_IDS", "").split(",") if 
 DATABASE_URL = os.getenv("DATABASE_URL")
 PROVIDER_TOKEN_TEST = os.getenv("PROVIDER_TOKEN_TEST")
 PROVIDER_TOKEN_LIVE = os.getenv("PROVIDER_TOKEN_LIVE")
-BOT_USERNAME = os.getenv("BOT_USERNAME", "BaziExpert_Bot")
+BOT_USERNAME = os.getenv("BOT_USERNAME")
 
 if not all([BOT_TOKEN, DATABASE_URL, PROVIDER_TOKEN_LIVE]):
     raise ValueError("Не все переменные окружения заданы! Нужны: BOT_TOKEN, DATABASE_URL, PROVIDER_TOKEN_LIVE")
