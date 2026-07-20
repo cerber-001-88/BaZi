@@ -1843,7 +1843,7 @@ async def payment_choice_callback(callback: types.CallbackQuery, state: FSMConte
         await callback.answer("⛔ Нет прав.", show_alert=True)
         return
 
-    choice = callback.data.split("_")[2]  # test, live или cancel
+    choice = callback.data.split("_")[2]
     if choice == "cancel":
         await callback.message.edit_text("❌ Оплата отменена.")
         await state.clear()
@@ -1851,39 +1851,70 @@ async def payment_choice_callback(callback: types.CallbackQuery, state: FSMConte
         return
 
     data = await state.get_data()
-    order_id = data.get('order_id')
-    final_price = data.get('final_price')
-    order_data = data.get('order_data')
+    logger.info(f"Payment choice data: {data}")  # для отладки
 
-    if not order_id or not final_price or not order_data:
-        await callback.message.edit_text("❌ Ошибка: данные заказа не найдены. Попробуйте заново.")
+    # Проверяем наличие данных для заказа
+    if 'order_id' in data and 'final_price' in data and 'order_data' in data:
+        order_id = data['order_id']
+        final_price = data['final_price']
+        order_data = data['order_data']
+        try:
+            await send_invoice_with_token(user_id, order_id, final_price, order_data, choice)
+            await callback.message.edit_text(f"💳 Счёт для заказа №{order_id} отправлен. Оплатите его, чтобы завершить оформление.")
+            await state.clear()
+            await callback.answer()
+        except Exception as e:
+            logger.error(f"Ошибка отправки инвойса для заказа: {e}")
+            await callback.message.edit_text(f"❌ Не удалось создать платёжный счёт. Ошибка: {e}")
+            await state.clear()
+            await callback.answer()
+        return
+
+    # Проверяем наличие данных для сертификата
+    elif 'gift_amount' in data:
+        gift_amount = data['gift_amount']
+        gift_message = data.get('gift_message')
+        token = get_provider_token(user_id, choice)
+        payload = f"gift_{user_id}_{int(datetime.now().timestamp())}"
+        try:
+            await bot.send_invoice(
+                chat_id=user_id,
+                title="Подарочный сертификат",
+                description=f"Сертификат на сумму {gift_amount} ₽ для оплаты услуг BaziExpert.",
+                payload=payload,
+                provider_token=token,
+                currency="RUB",
+                prices=[LabeledPrice(label=f"Сертификат {gift_amount} ₽", amount=int(gift_amount * 100))],
+                start_parameter="gift_purchase",
+                need_email=False,
+                need_phone_number=False,
+            )
+            await callback.message.edit_text("💳 Оплатите счёт для получения сертификата.")
+            await state.clear()
+            await callback.answer()
+        except Exception as e:
+            logger.error(f"Ошибка отправки инвойса на сертификат: {e}")
+            await callback.message.edit_text(f"❌ Ошибка: {e}")
+            await state.clear()
+            await callback.answer()
+        return
+
+    else:
+        await callback.message.edit_text("❌ Ошибка: не удалось определить тип оплаты. Попробуйте заново.")
         await state.clear()
         await callback.answer()
         return
 
-    try:
-        await send_invoice_with_token(user_id, order_id, final_price, order_data, choice)
-        await callback.message.edit_text(f"💳 Счёт для заказа №{order_id} отправлен. Оплатите его, чтобы завершить оформление.")
-        await state.clear()
-        await callback.answer()
-    except Exception as e:
-        logger.error(f"Ошибка отправки инвойса после выбора токена: {e}")
-        await callback.message.edit_text(f"❌ Не удалось создать платёжный счёт. Ошибка: {e}")
-        await state.clear()
-        await callback.answer()
-
 @dp.message(F.text == "🎁 Подарочный сертификат")
 async def cmd_gift_certificate(message: types.Message, state: FSMContext):
+    await state.clear()  # <-- ОЧИСТКА СОСТОЯНИЯ
     user_id = message.from_user.id
     if user_id == bot.id:
         await message.answer("⛔ Бот не может покупать сертификаты.")
         return
     
-    # Проверка включения платежей для клиентов
     if not await is_payments_enabled() and user_id not in ADMIN_IDS:
-        await message.answer(
-            "⛔ В данный момент приём платежей временно приостановлен. Пожалуйста, попробуйте позже."
-        )
+        await message.answer("⛔ В данный момент приём платежей временно приостановлен. Пожалуйста, попробуйте позже.")
         return
     
     await message.answer(
