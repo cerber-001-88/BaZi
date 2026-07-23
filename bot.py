@@ -152,7 +152,7 @@ async def create_tables():
             'qr_pdf_size': '200',
             'qr_pdf_label': 'Отсканируйте для активации',
             'qr_pdf_label_font_size': '14',
-            'payments_enabled': 'true'   # <-- НОВАЯ НАСТРОЙКА
+            'payments_enabled': 'true'
         }
         for key, val in default_settings.items():
             await conn.execute('''
@@ -171,9 +171,11 @@ async def create_tables():
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 used_at TIMESTAMP,
                 expires_at TIMESTAMP,
-                order_id INTEGER DEFAULT NULL
+                order_id INTEGER DEFAULT NULL,
+                gift_message TEXT
             )
         ''')
+        await conn.execute('ALTER TABLE gift_certificates ADD COLUMN IF NOT EXISTS gift_message TEXT')
         await conn.execute('''
             CREATE TABLE IF NOT EXISTS gift_templates (
                 id SERIAL PRIMARY KEY,
@@ -539,6 +541,17 @@ async def generate_certificate_files(code: str, amount: int) -> tuple:
     else:
         raise Exception("Ошибка генерации изображения сертификата")
 
+# ================== НОВАЯ ФУНКЦИЯ ДЛЯ СОЗДАНИЯ ВРЕМЕННОЙ ЗАПИСИ СЕРТИФИКАТА ==================
+async def create_pending_gift_certificate(purchaser_id: int, amount: int, gift_message: str = None) -> int:
+    """Создаёт запись сертификата со статусом pending и возвращает её id."""
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow('''
+            INSERT INTO gift_certificates (code, purchaser_id, amount, balance, status, gift_message)
+            VALUES ($1, $2, $3, $4, $5, $6)
+            RETURNING id
+        ''', 'PENDING', purchaser_id, amount, 0, 'pending', gift_message)
+        return row['id']
+
 async def create_gift_certificate(purchaser_id: int, amount: int, recipient_id: int = None) -> dict:
     prefix = await get_setting('cert_code_prefix', 'GIFT-')
     length = int(await get_setting('cert_code_length', '8'))
@@ -801,7 +814,7 @@ def get_admin_keyboard():
             [KeyboardButton(text="⏳ Новые заявки")],
             [KeyboardButton(text="📋 Текущий заказ"), KeyboardButton(text="📋 Все заявки")],
             [KeyboardButton(text="📊 Статистика"), KeyboardButton(text="📢 Рассылка")],
-            [KeyboardButton(text="💰 Изменить цену"), KeyboardButton(text="⚙️ Настройки платежей")],  # <-- заменили "Проверить платежи"
+            [KeyboardButton(text="💰 Изменить цену"), KeyboardButton(text="⚙️ Настройки платежей")],
             [KeyboardButton(text="🎁 Сертификаты"), KeyboardButton(text="👤 Панель клиента")]
         ],
         resize_keyboard=True
@@ -968,12 +981,10 @@ async def show_payment_settings(target, edit: bool = False):
     )
     
     if edit and hasattr(target, 'message'):
-        # Редактируем существующее сообщение
         await target.message.edit_text(text, reply_markup=keyboard)
     elif edit and hasattr(target, 'edit_text'):
         await target.edit_text(text, reply_markup=keyboard)
     else:
-        # Отправляем новое сообщение
         await target.answer(text, reply_markup=keyboard)
 
 # ============================================================
@@ -1192,7 +1203,6 @@ async def pay_order_callback(callback: types.CallbackQuery, state: FSMContext):
         await callback.answer()
         return
     
-    # Для обычных пользователей – сразу инвойс с боевым токеном
     payload = f"bazi_{order_id}_{int(datetime.now().timestamp())}"
     try:
         await bot.send_invoice(
@@ -1315,7 +1325,6 @@ async def cmd_order(message: types.Message, state: FSMContext):
         await message.answer("⛔ Бот не может оформлять заказы для себя.")
         return
     
-    # Проверка включения платежей для клиентов
     if not await is_payments_enabled() and user_id not in ADMIN_IDS:
         await message.answer(
             "⛔ В данный момент приём платежей временно приостановлен. Пожалуйста, попробуйте позже."
@@ -1817,7 +1826,6 @@ async def confirm_order_final(message: types.Message, state: FSMContext, user_id
             )
             await state.clear()
         else:
-            # Если пользователь админ – предлагаем выбор токена
             if user_id in ADMIN_IDS:
                 await state.update_data(order_id=order_id, final_price=final_price, order_data=data)
                 await message.answer(
@@ -1827,7 +1835,6 @@ async def confirm_order_final(message: types.Message, state: FSMContext, user_id
                 await state.set_state(OrderStates.waiting_payment_choice)
                 return
 
-            # Для обычных пользователей – сразу инвойс с боевым токеном
             await send_invoice_with_token(user_id, order_id, final_price, data, "live")
             await state.clear()
     except Exception as e:
@@ -1851,7 +1858,7 @@ async def payment_choice_callback(callback: types.CallbackQuery, state: FSMConte
         return
 
     data = await state.get_data()
-    logger.info(f"Payment choice data: {data}")  # для отладки
+    logger.info(f"Payment choice data: {data}")
 
     # Проверяем наличие данных для заказа
     if 'order_id' in data and 'final_price' in data and 'order_data' in data:
@@ -1874,8 +1881,10 @@ async def payment_choice_callback(callback: types.CallbackQuery, state: FSMConte
     elif 'gift_amount' in data:
         gift_amount = data['gift_amount']
         gift_message = data.get('gift_message')
+        # Создаём временную запись в БД перед отправкой инвойса
+        pending_id = await create_pending_gift_certificate(user_id, gift_amount, gift_message)
         token = get_provider_token(user_id, choice)
-        payload = f"gift_{user_id}_{int(datetime.now().timestamp())}"
+        payload = f"gift_{pending_id}_{user_id}"
         try:
             await bot.send_invoice(
                 chat_id=user_id,
@@ -1890,6 +1899,7 @@ async def payment_choice_callback(callback: types.CallbackQuery, state: FSMConte
                 need_phone_number=False,
             )
             await callback.message.edit_text("💳 Оплатите счёт для получения сертификата.")
+            # Очищаем состояние, но данные уже сохранены в БД
             await state.clear()
             await callback.answer()
         except Exception as e:
@@ -1907,7 +1917,7 @@ async def payment_choice_callback(callback: types.CallbackQuery, state: FSMConte
 
 @dp.message(F.text == "🎁 Подарочный сертификат")
 async def cmd_gift_certificate(message: types.Message, state: FSMContext):
-    await state.clear()  # <-- ОЧИСТКА СОСТОЯНИЯ
+    await state.clear()
     user_id = message.from_user.id
     if user_id == bot.id:
         await message.answer("⛔ Бот не может покупать сертификаты.")
@@ -2014,8 +2024,8 @@ async def confirm_gift_purchase(callback: types.CallbackQuery, state: FSMContext
         await callback.answer("Ошибка: выберите номинал.", show_alert=True)
         return
     
-    # Для админа предлагаем выбор токена
     if user_id in ADMIN_IDS:
+        # Для админа сохраняем данные в состояние для последующего выбора токена
         await state.update_data(gift_amount=amount, gift_message=gift_message)
         await callback.message.edit_text(
             "Выберите режим оплаты для сертификата:",
@@ -2025,9 +2035,10 @@ async def confirm_gift_purchase(callback: types.CallbackQuery, state: FSMContext
         await callback.answer()
         return
     
-    # Для обычных пользователей – сразу инвойс с боевым токеном
-    payload = f"gift_{user_id}_{int(datetime.now().timestamp())}"
-    await state.update_data(payload=payload, gift_message=gift_message)
+    # Для обычных пользователей – создаём запись в БД и отправляем инвойс
+    pending_id = await create_pending_gift_certificate(user_id, amount, gift_message)
+    payload = f"gift_{pending_id}_{user_id}"
+    await state.update_data(payload=payload, gift_message=gift_message)  # на всякий случай
     try:
         await bot.send_invoice(
             chat_id=user_id,
@@ -2107,7 +2118,7 @@ async def payment_change_price(callback: types.CallbackQuery, state: FSMContext)
         "Для отмены отправьте /cancel"
     )
     await state.set_state(OrderStates.waiting_new_price)
-    await state.update_data(return_to_payment_settings=True)  # флаг для возврата
+    await state.update_data(return_to_payment_settings=True)
     await callback.answer()
 
 @dp.callback_query(F.data == "payment_back")
@@ -2142,10 +2153,8 @@ async def process_new_price(message: types.Message, state: FSMContext):
     await state.clear()
     
     if return_to_settings:
-        # Возвращаем в настройки платежей
         await show_payment_settings(message)
     else:
-        # Старое поведение (если вызвано из другой кнопки)
         await message.answer("Главное меню:", reply_markup=get_main_keyboard())
 
 # ============================================================
@@ -2193,12 +2202,44 @@ async def successful_payment_handler(message: types.Message, state: FSMContext):
     payload = payment.invoice_payload
 
     if payload.startswith('gift_'):
-        amount = payment.total_amount // 100
-        data = await state.get_data()
-        gift_message = data.get('gift_message')
-        cert_data = await create_gift_certificate(purchaser_id=user_id, amount=amount)
-        code = cert_data['code']
+        # Парсим pending_id и user_id из payload
+        parts = payload.split('_')
+        if len(parts) >= 2:
+            pending_id = int(parts[1])
+        else:
+            await message.answer("❌ Ошибка: неверный идентификатор платежа.")
+            return
+
+        # Получаем данные из БД
+        async with db_pool.acquire() as conn:
+            record = await conn.fetchrow('SELECT * FROM gift_certificates WHERE id = $1', pending_id)
+            if not record or record['status'] != 'pending':
+                await message.answer("❌ Сертификат не найден или уже обработан.")
+                return
+            amount = record['amount']
+            gift_message = record['gift_message']
+            purchaser_id = record['purchaser_id']
+
+        # Генерируем уникальный код
+        prefix = await get_setting('cert_code_prefix', 'GIFT-')
+        length = int(await get_setting('cert_code_length', '8'))
+        while True:
+            code = generate_gift_code(prefix=prefix, length=length)
+            async with db_pool.acquire() as conn:
+                existing = await conn.fetchval('SELECT id FROM gift_certificates WHERE code = $1', code)
+                if not existing:
+                    break
+
+        # Обновляем запись: добавляем код, баланс, статус
+        async with db_pool.acquire() as conn:
+            await conn.execute('''
+                UPDATE gift_certificates
+                SET code = $1, balance = $2, status = 'active', used_at = NULL
+                WHERE id = $3
+            ''', code, amount, pending_id)
+
         await notify_admin_gift_purchase(user_id, amount, code, gift_message)
+
         try:
             image_path, pdf_path = await generate_certificate_files(code, amount)
         except Exception as e:
@@ -2224,10 +2265,9 @@ async def successful_payment_handler(message: types.Message, state: FSMContext):
             "(с изображением и с PDF-файлом) вашему получателю. Он сможет активировать сертификат "
             "по ссылке в первом сообщении."
         )
-        await bot.send_message(user_id, instruction_text)
+        await bot.send_message(user_id, instruction_text, reply_markup=get_main_keyboard())
 
         await state.clear()
-        await message.answer(reply_markup=get_main_keyboard())
 
     else:
         payload_parts = payload.split('_')
@@ -2343,7 +2383,7 @@ async def about(message: types.Message):
 @dp.message(F.text == "📞 Контакты")
 async def contacts(message: types.Message):
     await message.answer(
-        "📞 Контакты:\n✉️ Админ: @Artem_001_88\n📧 Чат поддержки: https://telegram.me/c/4348310926/2"
+        "📞 Контакты:\n✉️ Админ: @Artem_001_88\n📧 Email: baziexpert_bot@mail.ru\n💬 Чат поддержки: https://t.me/+ivPVuZXMcfQyYWYy", disable_web_page_preview=True
     )
 
 async def notify_admin_new_order(order_id: int, user: Record):
@@ -3831,10 +3871,14 @@ async def main():
     os.makedirs('media/certificates', exist_ok=True)
     os.makedirs('fonts', exist_ok=True)
     await init_db_pool()
+    
+    # Удаляем webhook, чтобы использовать polling (избегаем конфликта)
+    await bot.delete_webhook(drop_pending_updates=True)
+    
     try:
         await dp.start_polling(bot, skip_updates=True)
     finally:
         await close_db_pool()
 
 if __name__ == "__main__":
-    asyncio.run(main())                
+    asyncio.run(main())
